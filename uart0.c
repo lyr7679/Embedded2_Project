@@ -1,0 +1,295 @@
+// UART0 Library
+// Jason Losh
+
+//-----------------------------------------------------------------------------
+// Hardware Target
+//-----------------------------------------------------------------------------
+
+// Target Platform: EK-TM4C123GXL
+// Target uC:       TM4C123GH6PM
+// System Clock:    -
+
+// Hardware configuration:
+// UART Interface:
+//   U0TX (PA1) and U0RX (PA0) are connected to the 2nd controller
+//   The USB on the 2nd controller enumerates to an ICDI interface and a virtual COM port
+
+//-----------------------------------------------------------------------------
+// Device includes, defines, and assembler directives
+//-----------------------------------------------------------------------------
+
+#include <stdint.h>
+#include <stdbool.h>
+#include "tm4c123gh6pm.h"
+#include "uart0.h"
+#include "gpio.h"
+
+// Pins
+#define UART_TX PORTA,1
+#define UART_RX PORTA,0
+
+//-----------------------------------------------------------------------------
+// Global variables
+//-----------------------------------------------------------------------------
+
+//-----------------------------------------------------------------------------
+// Subroutines
+//-----------------------------------------------------------------------------
+
+// Initialize UART0
+void initUart0(void)
+{
+    // Enable clocks
+    SYSCTL_RCGCUART_R |= SYSCTL_RCGCUART_R0;
+    _delay_cycles(3);
+    enablePort(PORTA);
+
+    // Configure UART0 pins
+    selectPinPushPullOutput(UART_TX);
+    selectPinDigitalInput(UART_RX);
+    setPinAuxFunction(UART_TX, GPIO_PCTL_PA1_U0TX);
+    setPinAuxFunction(UART_RX, GPIO_PCTL_PA0_U0RX);
+
+    // Configure UART0 with default baud rate
+    UART0_CTL_R = 0;                                    // turn-off UART0 to allow safe programming
+    UART0_CC_R = UART_CC_CS_SYSCLK;                     // use system clock (usually 40 MHz)
+}
+
+// Set baud rate as function of instruction cycle frequency
+void setUart0BaudRate(uint32_t baudRate, uint32_t fcyc)
+{
+    uint32_t divisorTimes128 = (fcyc * 8) / baudRate;   // calculate divisor (r) in units of 1/128,
+                                                        // where r = fcyc / 16 * baudRate
+    divisorTimes128 += 1;                               // add 1/128 to allow rounding
+    UART0_CTL_R = 0;                                    // turn-off UART0 to allow safe programming
+    UART0_IBRD_R = divisorTimes128 >> 7;                // set integer value to floor(r)
+    UART0_FBRD_R = ((divisorTimes128) >> 1) & 63;       // set fractional value to round(fract(r)*64)
+    UART0_LCRH_R = UART_LCRH_WLEN_8 | UART_LCRH_FEN;    // configure for 8N1 w/ 16-level FIFO
+    UART0_CTL_R = UART_CTL_TXE | UART_CTL_RXE | UART_CTL_UARTEN;
+                                                        // turn-on UART0
+}
+
+// Blocking function that writes a serial character when the UART buffer is not full
+void putcUart0(char c)
+{
+    while (UART0_FR_R & UART_FR_TXFF);               // wait if uart0 tx fifo full
+    UART0_DR_R = c;                                  // write character to fifo
+}
+
+// Blocking function that writes a string when the UART buffer is not full
+void putsUart0(char* str)
+{
+    uint8_t i = 0;
+    while (str[i] != '\0')
+        putcUart0(str[i++]);
+}
+
+// Blocking function that returns with serial data once the buffer is not empty
+char getcUart0(void)
+{
+    while (UART0_FR_R & UART_FR_RXFE);               // wait if uart0 rx fifo empty
+    return UART0_DR_R & 0xFF;                        // get character from fifo
+}
+
+void getsUart0(USER_DATA *data)
+{
+    uint8_t count = 0;
+    char ch = '\0';
+
+    while(1)
+    {
+        ch = getcUart0();
+
+        if((ch == 8) || (ch == 127))
+        {
+            if(count > 0)
+            {
+                count--;
+            }
+        }
+        else if(ch == 13)
+        {
+            data->buffer[count] = 0;
+            return;
+        }
+        else
+        {
+            if(ch >= 32)
+            {
+                data->buffer[count] = ch;
+                count++;
+            }
+
+            if(count == MAX_CHARS)
+            {
+                data->buffer[count + 1] = '\0';
+                return;
+            }
+        }
+
+    }
+
+}
+
+// Returns the status of the receive buffer
+bool kbhitUart0(void)
+{
+    return !(UART0_FR_R & UART_FR_RXFE);
+}
+
+
+void parseFields(USER_DATA *data)
+{
+    uint8_t i = 0;
+
+    char firstval = '\0';
+    data->fieldCount = 0;
+    char previous = 'd';
+
+    for(i = 0; (data->buffer[i] != '\0') && (data->fieldCount < MAX_FIELDS); i++)
+    {
+        firstval = data->buffer[i];
+        if((firstval >= 65 && firstval <= 90) || (firstval >= 97 && firstval <= 122))
+        {
+            //alpha
+            if(previous == 'd')
+            {
+                data->fieldPosition[data->fieldCount] = i;
+                data->fieldType[data->fieldCount] = 'a';
+                data->fieldCount++;
+                previous = 'a';
+            }
+
+        }
+        else if(firstval >= 48 && firstval <= 57)
+        {
+            //numeric
+            if(previous == 'd')
+            {
+                data->fieldPosition[data->fieldCount] = i;
+                data->fieldType[data->fieldCount] = 'n';
+                data->fieldCount++;
+                previous = 'n';
+            }
+        }
+        else
+        {
+            //delimiter
+            data->buffer[i] = '\0';
+            previous = 'd';
+        }
+
+        if(data->fieldCount == MAX_FIELDS)
+        {
+            while((data->buffer[i] >= 65 && data->buffer[i] <= 90) || (data->buffer[i] >= 97 && data->buffer[i] <= 122) || (data->buffer[i] >= 48 && data->buffer[i] <= 57))
+            {
+                i++;
+            }
+            data->buffer[i] = '\0';
+        }
+    }
+
+    return;
+}
+
+char* getFieldString(USER_DATA* data, uint8_t fieldNumber)
+{
+    uint8_t i = 0;
+    uint8_t j = 0;
+    char returnstr[MAX_CHARS] = {'\0'};
+
+    if(fieldNumber <= data->fieldCount)
+    {
+        i = data->fieldPosition[fieldNumber];
+        while(data->buffer[i] != '\0')
+        {
+            returnstr[j++] = data->buffer[i];
+            i++;
+        }
+
+        return returnstr;
+//        return (&data->fieldPosition[fieldNumber]);
+        //return &data->buffer[data->fieldPosition[fieldNumber]];
+    }
+    else
+        return 0;
+}
+
+int32_t getFieldInteger(USER_DATA * data, uint8_t fieldNumber)
+{
+    int32_t returnint = 0;
+
+    char *returnstr;
+
+    if((fieldNumber <= data->fieldCount) && (data->fieldType[fieldNumber] == 'n'))
+    {
+        returnstr = getFieldString(data, fieldNumber);
+    }
+
+    if(returnstr[0] != '\0')
+    {
+        //call self-made atoi function
+        returnint = MyAtoi(returnstr);
+    }
+
+    return returnint;
+}
+
+int32_t MyAtoi(char * str)
+{
+    uint8_t i = 0;
+    int32_t res = 0;
+
+
+    for (i = 0; str[i] != '\0'; i++)
+    {
+        res = res * 10 + str[i] - '0';
+    }
+
+    return res;
+}
+
+bool isCommand(USER_DATA* data, const char strCommand[], uint8_t minArguments)
+{
+    bool returnbool = false;
+    char *returnstr;
+    uint8_t i = 0;
+
+    if(minArguments <= (data->fieldCount - 1))
+    {
+        returnstr = getFieldString(data, 0);
+
+        for(i = 0; returnstr[i] != '\0'; i++)
+        {
+            if(strCommand[i] != returnstr[i])
+            {
+                return returnbool;
+            }
+        }
+        returnbool = true;
+    }
+
+    return returnbool;
+}
+
+bool strCmp(USER_DATA *data, const char strCommand[])
+{
+    bool returnbool = false;
+    char *returnstr;
+    uint8_t i = 0;
+
+    returnstr = getFieldString(data, 1);
+
+    for(i = 0; returnstr[i] != '\0'; i++)
+    {
+        if(strCommand[i] != returnstr[i])
+        {
+            return returnbool;
+        }
+    }
+    returnbool = true;
+
+
+    return returnbool;
+
+}
